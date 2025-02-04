@@ -227,7 +227,8 @@ def setup(credentials: str):
 
 
 ##########################################
-canvas, xnat = setup('credentials.yaml')
-manager = IntegrationManager(canvas, xnat)
-manager.execute_integration()
+if __name__ == "__main__":
+    canvas, xnat = setup('credentials.yaml')
+    manager = IntegrationManager(canvas, xnat)
+    manager.execute_integration()
 ##########################################
