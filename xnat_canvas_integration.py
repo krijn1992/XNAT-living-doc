@@ -1,30 +1,10 @@
-########################################################################################################################
-# Python script for integration between XNAT and Canvas
-#
-# Authors: Sjoerd Zagema, Krijn Tiek
-#
-# Version: 09012025
-#
-# Scope:
-# This script provides an automated connection between the Medical Imaging Archive XNAT and Online Coursing Provider
-# Canvas. The aim is to check the users for all courses that include imaging and whose images are stored on XNAT. By
-# cross-referencing user lists between the applications we're able to enable accounts on XNAT of only those users who
-# are a member of Canvas Courses linked to Medical Imaging. We're also able to automatically assign them to projects in
-# XNAT that correspond to courses they follow in the Canvas application.
-#
-#
-# To do:
-# - Get all courses through functional account (now it is just a list)
-# - Broaden information in logging
-# - Create local cache with enabled accounts to skip next time
-# - Other API optimisations
-# - Unittests
-#
-########################################################################################################################
+# xnat_canvas_integration.py
+
 import requests
 from tqdm import tqdm
 import yaml
 import logging
+import xml.etree.ElementTree as ET
 
 
 class CanvasIntegration:
@@ -44,12 +24,12 @@ class CanvasIntegration:
 
     def get_canvas_courses(self):
         # Should get all courses via functional account
-        response = self._request('GET', "/courses",params={'enrollment_type': 'teacher'})
+        response = self._request('GET', "/courses")#, params={'enrollment_type': 'teacher'})
         course_ids = [course['id'] for course in response.json()]
         course_names = [course['name'] for course in response.json()]
         # Until this is an actual account, override the outcome
-        # course_ids = [16583]
-        return course_ids
+        # course_ids = [12553]
+        return course_ids, course_names
 
     def get_canvas_participants(self, project_id: int) -> list:
         participants = []
@@ -68,7 +48,6 @@ class CanvasIntegration:
                 break
         return participants
 
-
 class XNATIntegration:
     def __init__(self, xnat_url: str, username: str, password: str):
         # Initialize the XNATIntegration class with the necessary credentials and project ID
@@ -85,10 +64,12 @@ class XNATIntegration:
             logging.error(f"API Error: {response.status_code} - {response.text}")
         return response
 
-    def _request(self, method: str, endpoint: str, data: dict = None, params: dict = None) -> requests.Response:
+    def _request(self, method: str, endpoint: str,add_header:dict = None, data = None, params: dict = None) -> requests.Response:
+        headers = {'Cookie': f'JSESSIONID={self.token}'}
+        if add_header is not None:
+            headers.update(add_header)
         response = requests.request(method, f"{self.xnat_url}{endpoint}",
-                                    headers={'Cookie': f'JSESSIONID={self.token}'},
-                                    json=data, params=params)
+                                    headers=headers, data=data, params=params)
         if response.status_code not in [200, 204]:
             logging.error(f"API Error: {response.status_code} - {response.text}")
         return response
@@ -99,11 +80,31 @@ class XNATIntegration:
             self.token = response.cookies['JSESSIONID']
         return None
 
-    def check_users_in_xnat(self) -> dict:
+    def get_users_in_xnat(self) -> dict:
         response = self._request('GET', "/xapi/users")
         if response.ok:
             return response.json()
         return None
+
+    def get_project_ids_list(self) -> list:
+        response = self._request('GET', f"/data/projects")
+        projects = response.json()
+        results = projects.get('ResultSet', {}).get('Result', [])
+        return [project['ID'] for project in results]
+
+    def create_project(self, xml_string: str):
+        headers = {
+            "Content-Type": "application/xml",
+            'Cookie': f'JSESSIONID={self.token}'
+        }
+        # Send the POST request
+        response = requests.post(f"{self.xnat_url}/data/projects", headers=headers, data=xml_string)
+
+        # Check the response
+        if response.status_code == 200:
+            print("Project created successfully!")
+        else:
+            print(f"Failed to create project: {response.status_code},{response.text}")
 
     def check_user_verified_in_xnat(self, login_id: str) -> dict:
         response = self._request('GET', f"/xapi/users/{login_id}/verified")
@@ -149,6 +150,22 @@ class IntegrationManager:
         self.enabled_count = 0
         self.added_to_project_count = 0
 
+    def create_xml(self, course_id, course_name):
+        logging.info(f"Creating new project for course {course_name}, with ID {course_id}")
+        namespace = "http://nrg.wustl.edu/xnat"
+        ET.register_namespace("xnat", namespace)
+
+        # Create the root element with the namespace
+        root = ET.Element("{http://nrg.wustl.edu/xnat}projectData")
+
+        # Add sub-elements with the correct field names
+        ET.SubElement(root, "{http://nrg.wustl.edu/xnat}ID").text = f"{course_id}"
+        ET.SubElement(root, "{http://nrg.wustl.edu/xnat}secondary_ID").text = f"{course_id}"
+        ET.SubElement(root, "{http://nrg.wustl.edu/xnat}name").text = f"{course_name}"
+
+        xml_string = ET.tostring(root, encoding='utf-8', xml_declaration=True, method='xml').decode('utf-8')
+        return (xml_string)
+
     def process_participant(self, participant, project_id, project_users):
         # Extract login_id and email from the participant dictionary
         login_id = participant['login_id']
@@ -178,26 +195,34 @@ class IntegrationManager:
 
     def execute_integration(self):
         self.xnat.get_user_token()
-        projects = self.canvas.get_canvas_courses()
-        total_projects = len(projects)
-        xnat_logins = self.xnat.check_users_in_xnat()
-        print(f"Starting integration for {total_projects} course(s) in Canvas...")
-        logging.info(f"Starting integration for {total_projects} course(s) in Canvas...")
-        print(f"Retrieving the XNAT user list from {self.xnat.xnat_url}, containing {len(xnat_logins)} items...")
-        pbar_c = tqdm(projects, unit='courses')
-        for project_id in pbar_c:
-            pbar_c.set_description(f'Processing integration, course {project_id}')
-            canvas_participants = self.canvas.get_canvas_participants(project_id)
-            project_users = self.xnat.get_user_project_data(project_id)
+        course_ids, course_names = self.canvas.get_canvas_courses()
+        project_ids = self.xnat.get_project_ids_list()
+        xnat_users = self.xnat.get_users_in_xnat()
+        print(f"Starting integration for {len(course_ids)} course(s) in Canvas...")
+        logging.info(f"Started integration for {len(course_ids)} course(s) in Canvas...")
+        print(f"Retrieving the XNAT user list from {self.xnat.xnat_url}, containing {len(xnat_users)} items...")
+        logging.info(f"Retrieved the XNAT user list from {self.xnat.xnat_url}, containing {len(xnat_users)} items...")
+        for course_id in course_ids:
+            if f"{course_id}" not in project_ids:
+                print(f"{course_id} not found in project_ids, creating project")
+                course_name = course_names[course_ids.index(course_id)]
+                xml_string = self.create_xml(course_id, course_name)
+                self.xnat.create_project(xml_string)
+
+        pbar_c = tqdm(course_ids, unit='courses')
+        for course_id in pbar_c:
+            pbar_c.set_description(f'Processing integration, course {course_id}')
+            canvas_participants = self.canvas.get_canvas_participants(course_id)
+            project_users = self.xnat.get_user_project_data(course_id)
             total_participants = len(canvas_participants)
             # Loop through every participant in the canvas_participants list
             pbar_p = tqdm(canvas_participants, unit='participants', leave=False)
             for participant in pbar_p:
                 # Find the position of the participant in the canvas_participants list
                 part_nr = pbar_p.n + 1
-                pbar_p.set_description(f'Processing course {project_id}, user {part_nr}/{total_participants}')
-                if 'login_id' in participant and participant['login_id'] in xnat_logins:
-                    self.process_participant(participant, project_id, project_users)
+                pbar_p.set_description(f'Processing course {course_id}, user {part_nr}/{total_participants}')
+                if 'login_id' in participant and participant['login_id'] in xnat_users:
+                    self.process_participant(participant, course_id, project_users)
             # Log the counts at the end
         logging.info(f"Total users processed: {self.processed_count}")
         logging.info(f"Total users verified: {self.verified_count}")
@@ -205,7 +230,6 @@ class IntegrationManager:
         logging.info(f"Total users added to project: {self.added_to_project_count}")
 
         self.xnat.close_connections()
-
 
 def setup(credentials: str):
     # Open YAML file with credentials and link them to variables
@@ -221,14 +245,11 @@ def setup(credentials: str):
             password=cred['xnat']['password']
         )
     # Configure logging
-    logging.basicConfig(filename='logs/integration_log.txt', level=logging.ERROR,
+    logging.basicConfig(filename='logs/integration_log.txt', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s')
     return canvas, xnat
 
-
-##########################################
 if __name__ == "__main__":
     canvas, xnat = setup('credentials.yaml')
     manager = IntegrationManager(canvas, xnat)
     manager.execute_integration()
-##########################################
